@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Router } from "express";
 import type { Connection } from "mongoose";
-import type Redis from "ioredis";
+import type { Redis } from "ioredis";
 import { z } from "zod";
 import { getTenantConnection } from "../db/tenant-connection.js";
 import { tenantModels } from "./models.js";
@@ -17,6 +17,109 @@ const releaseLock = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.
 
 export function billingRouter(redis: Redis) {
   const router = Router();
+
+  router.post("/refunds", async (req, res, next) => {
+    const parsed = z.object({
+      chargeId: z.string().regex(/^[a-f\d]{24}$/i),
+      amountMinor: z.number().int().positive().max(100_000_000),
+      reason: z.string().trim().max(300).optional(),
+    }).strict().safeParse(req.body);
+    const key = req.header("idempotency-key")?.trim();
+    if (!parsed.success) return res.status(400).json({ error: "Invalid refund record", details: parsed.error.flatten() });
+    if (!key || key.length > 128) return res.status(400).json({ error: "A 1-128 character Idempotency-Key header is required" });
+
+    const { organizationId, subject } = req.auth!;
+    const requestHash = createHash("sha256").update(JSON.stringify(parsed.data)).digest("hex");
+    const redisKey = `ledgerguard:refund-lock:${organizationId}:${createHash("sha256").update(key).digest("hex")}`;
+    const lockToken = randomUUID();
+    let locked = false;
+    let connection: Connection | undefined;
+    try {
+      locked = (await redis.set(redisKey, lockToken, "PX", 15000, "NX")) === "OK";
+      if (!locked) return res.status(409).json({ error: "A request with this idempotency key is in progress; retry shortly" });
+
+      connection = getTenantConnection(organizationId);
+      await connection.asPromise();
+      const { Charge, Refund, RefundIdempotency } = tenantModels(connection);
+      await Promise.all([Charge.init(), Refund.init(), RefundIdempotency.init()]);
+      const existing = await RefundIdempotency.findOne({ key }).lean();
+      if (existing) {
+        if (existing.requestHash !== requestHash) return res.status(409).json({ error: "Idempotency key was already used with a different refund" });
+        const refund = await Refund.findById(existing.refundId).lean();
+        if (!refund) return res.status(500).json({ error: "Refund idempotency record is inconsistent" });
+        return res.status(200).json({ refund, replayed: true });
+      }
+
+      const session = await connection.startSession();
+      let refund: Record<string, unknown> | undefined;
+      try {
+        await session.withTransaction(async () => {
+          const charge = await Charge.findById(parsed.data.chargeId).session(session);
+          if (!charge) throw Object.assign(new Error("Charge not found for this tenant"), { status: 404 });
+          const updated = await Charge.findOneAndUpdate({
+            _id: charge._id,
+            $expr: { $lte: [{ $add: [{ $ifNull: ["$refundedMinor", 0] }, parsed.data.amountMinor] }, "$amountMinor"] },
+          }, { $inc: { refundedMinor: parsed.data.amountMinor } }, { session, new: false });
+          if (!updated) throw Object.assign(new Error("Refund amount exceeds the remaining charge balance"), { status: 409 });
+
+          const [created] = await Refund.create([{
+            chargeId: charge._id,
+            amountMinor: parsed.data.amountMinor,
+            currency: charge.currency,
+            reason: parsed.data.reason,
+            idempotencyKey: key,
+            createdBy: subject,
+          }], { session });
+          if (!created) throw new Error("Refund record creation failed");
+          await RefundIdempotency.create([{ key, requestHash, refundId: created._id }], { session });
+          refund = created.toObject();
+        }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+      } finally {
+        await session.endSession();
+      }
+      return res.status(201).json({ refund, replayed: false, note: "Accounting record created; no payment processor was contacted." });
+    } catch (error) {
+      if (connection && typeof error === "object" && error !== null && "code" in error && error.code === 11000) {
+        const { Refund, RefundIdempotency } = tenantModels(connection);
+        const existing = await RefundIdempotency.findOne({ key }).lean();
+        if (existing?.requestHash === requestHash) {
+          const refund = await Refund.findById(existing.refundId).lean();
+          if (refund) return res.status(200).json({ refund, replayed: true });
+        }
+        if (existing) return res.status(409).json({ error: "Idempotency key was already used with a different refund" });
+      }
+      return next(error);
+    } finally {
+      if (locked) await redis.eval(releaseLock, 1, redisKey, lockToken).catch(() => undefined);
+    }
+  });
+
+  router.get("/refunds", async (req, res, next) => {
+    const query = z.object({
+      page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+      limit: z.coerce.number().int().min(1).max(50).default(20),
+    }).safeParse(req.query);
+    if (!query.success) return res.status(400).json({ error: "Invalid pagination", details: query.error.flatten() });
+
+    let connection: Connection | undefined;
+    try {
+      connection = getTenantConnection(req.auth!.organizationId);
+      await connection.asPromise();
+      const { Refund } = tenantModels(connection);
+      const { page, limit } = query.data;
+      const [total, refunds] = await Promise.all([
+        Refund.countDocuments({}),
+        Refund.find({}).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      ]);
+      return res.json({
+        page, limit, total, pages: Math.ceil(total / limit),
+        refunds: refunds.map((refund) => ({
+          id: String(refund._id), chargeId: String(refund.chargeId), amountMinor: refund.amountMinor,
+          currency: refund.currency, reason: refund.reason ?? "", createdAt: refund.createdAt,
+        })),
+      });
+    } catch (error) { return next(error); }
+  });
 
   router.get("/charges", async (req, res, next) => {
     const query = z.object({

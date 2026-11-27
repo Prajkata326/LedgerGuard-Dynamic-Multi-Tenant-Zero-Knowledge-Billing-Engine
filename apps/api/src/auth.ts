@@ -9,14 +9,14 @@ declare global {
   }
 }
 
-let publicKeyPromise: ReturnType<typeof createPublicKey> | undefined;
+let publicKeyPromise: Promise<ReturnType<typeof createPublicKey>> | undefined;
 
 export async function authenticate(req: Request, res: Response, next: NextFunction) {
   try {
     const header = req.header("authorization");
     if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Bearer token required" });
-    publicKeyPromise ??= loadJwtPublicKey().then((pem) => createPublicKey(pem));
-    const { payload } = await jwtVerify(header.slice(7), await publicKeyPromise, {
+    const publicKey = publicKeyPromise ?? (publicKeyPromise = loadJwtPublicKey().then((pem) => createPublicKey(pem)));
+    const { payload } = await jwtVerify(header.slice(7), await publicKey, {
       algorithms: ["RS256"], issuer: config.JWT_ISSUER, audience: config.JWT_AUDIENCE,
     });
     if (typeof payload.sub !== "string" || typeof payload.org !== "string" || !config.tenantUris[payload.org]) {

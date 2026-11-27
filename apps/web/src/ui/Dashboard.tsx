@@ -6,7 +6,7 @@ ChartJS.register(CategoryScale, LinearScale, LineElement, BarElement, PointEleme
 
 const currencies = ["USD", "EUR", "GBP"];
 const fractionDigits = (currency: string) => {
-  try { return new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits; }
+  try { return new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits ?? 2; }
   catch { return 2; }
 };
 const money = (value: number, currency: string) => {

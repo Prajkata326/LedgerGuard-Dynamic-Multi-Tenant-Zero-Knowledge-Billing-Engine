@@ -2,14 +2,14 @@ import cors from "cors";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 import { authenticate } from "./auth.js";
 import { config } from "./config.js";
 import { closeTenantConnections } from "./db/tenant-connection.js";
 import { billingRouter } from "./billing/routes.js";
 
 const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: 2, enableReadyCheck: true });
-redis.on("error", (error) => console.error("Redis connection error", error.message));
+redis.on("error", (error: Error) => console.error("Redis connection error", error.message));
 
 const app = express();
 app.disable("x-powered-by");
